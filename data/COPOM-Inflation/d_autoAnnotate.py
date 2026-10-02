@@ -1,9 +1,14 @@
 import os
 import csv
+import sys
 import time
-from openai import OpenAI
+import numpy as np
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+# Importações de embeddings e LLM
+from langchain_community.llms import Ollama
+from langchain_huggingface import HuggingFaceEmbeddings
 
 SCRIPT_FOLDER = os.path.dirname(os.path.abspath(__file__))
 INPUT_FOLDER = os.path.join(SCRIPT_FOLDER, "3_sentences_selected")
@@ -19,12 +24,10 @@ if not os.path.exists(OUTPUT_FOLDER):
     os.makedirs(OUTPUT_FOLDER)
 
 load_dotenv()
-api_key = os.getenv("API_KEY")
-base_url = os.getenv("BASE_URL")
 
-MODEL = "gemma4:e4b"
+MODEL = "gemma4:e4b:fewshot"
 
-PROMPT = """
+PROMPT_TEMPLATE = """
 DEFINIÇÃO DE OTIMISMO:
 Ocorre quando as projeções indicam que a inflação ficará abaixo da meta ou dentro do intervalo de tolerância com folga. 
 Isso pode sinalizar que o Banco Central vê espaço para reduzir juros ou manter uma política monetária mais acomodatícia. 
@@ -37,9 +40,14 @@ AVALIE A FRASE COMO
 O para OTIMISTA
 N para NEUTRA
 P para PESSIMISTA
-SUA RESPOSTA DEVE SER APENAS UMA LETRA, SEM QUALQUER OUTRO TEXTO
+NÃO DEIXE DE RESPONDER E SUA RESPOSTA DEVE SER APENAS UMA DAS 3 LETRAS, SEM QUALQUER OUTRO TEXTO
+SE ACHAR A FRASE AMBIGUA, OU NÃO SOUBER CLASSIFICAR RESPONDA COM N
 
-A FRASE É:
+Utilize os exemplos abaixo para guiar sua avaliação:
+#exemplos#
+
+A FRASE A SER ANALISADA É:
+{sentence}
 """
 
 GRADE_MAP = {'O': 1, 'N': 0, 'P': -1}
@@ -86,29 +94,88 @@ def load_output_checkpoint():
     print(f"Resuming: {len(done)} sentences already in output file.")
     return done
 
-def build_few_shot_messages(existing):
-    messages = []
+def prepare_few_shot_index(existing, embedding_model):
+    """
+    Extrai anotações humanas únicas separando-as por categoria e pré-calcula os vetores.
+    """
+    human_examples = []
     seen_sentences = set()
+    
     for (date, sentence), ann in existing.items():
         if ann['model'] == 'human' and sentence not in seen_sentences:
             seen_sentences.add(sentence)
-            letter = REVERSE_GRADE_MAP[ann['grade']]
-            messages.append({"role": "user", "content": PROMPT + sentence})
-            messages.append({"role": "assistant", "content": letter})
-    return messages
+            human_examples.append({
+                'sentence': sentence,
+                'label': REVERSE_GRADE_MAP[ann['grade']] # 'O', 'N', ou 'P'
+            })
 
-def annotate_sentence(client, sentence, few_shot_messages):
-    messages = few_shot_messages + [{"role": "user", "content": PROMPT + sentence}]
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=5,
-        temperature=0,
-    )
-    answer = response.choices[0].message.content.strip().upper()
+    if not human_examples:
+        return [], None
+
+    print(f"Gerando embeddings para {len(human_examples)} exemplos manuais...")
+    sentences_list = [ex['sentence'] for ex in human_examples]
+    vectors = np.array(embedding_model.embed_documents(sentences_list))
+    
+    # Normalização L2 para calcular similaridade de cosseno via produto escalar
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    vectors_normalized = vectors / norms
+
+    return human_examples, vectors_normalized
+def get_dynamic_examples(sentence, embedding_model, human_examples, example_vectors, k_per_category=2):
+    """
+    Retorna os K_PER_CATEGORY exemplos mais similares para CADA classe ('O', 'N', 'P').
+    """
+    if not human_examples or k_per_category <= 0:
+        return ""
+
+    query_vec = np.array(embedding_model.embed_query(sentence))
+    query_norm = np.linalg.norm(query_vec)
+    if query_norm > 0:
+        query_vec = query_vec / query_norm
+
+    # Calcula similaridades com todos os exemplos
+    similarities = np.dot(example_vectors, query_vec)
+
+    selected_indices = []
+    categories = ['O', 'N', 'P']
+
+    # Busca os Top K mais parecidos DENTRO de cada classe
+    for cat in categories:
+        # Pega os índices pertencentes à categoria atual
+        cat_indices = [idx for idx, ex in enumerate(human_examples) if ex['label'] == cat]
+        
+        if not cat_indices:
+            continue
+
+        # Ordena os índices da categoria pela pontuação de similaridade
+        cat_indices_sorted = sorted(cat_indices, key=lambda idx: similarities[idx], reverse=True)
+        
+        # Pega até K elementos dessa categoria
+        selected_indices.extend(cat_indices_sorted[:k_per_category])
+
+    # Formata os exemplos selecionados para o prompt
+    formatted_examples = []
+    for idx in selected_indices:
+        ex = human_examples[idx]
+        formatted_examples.append(f"Frase: \"{ex['sentence']}\"\nClassificação: {ex['label']}")
+
+    return "\n\n".join(formatted_examples)
+
+def annotate_sentence(llm, sentence, embedding_model, human_examples, example_vectors, k=6):
+    examples_str = get_dynamic_examples(sentence, embedding_model, human_examples, example_vectors, k=k)
+    
+    prompt = PROMPT_TEMPLATE.replace("#exemplos#", examples_str).format(sentence=sentence)
+    print(f"\nPrompt enviado para LLM:\n{prompt}\n")
+    adssda
+    sys.exit()
+    response = llm.invoke(prompt)
+    answer = str(response).strip().upper()
+
     for char in answer:
         if char in GRADE_MAP:
             return GRADE_MAP[char]
+
     print(f"  Warning: unexpected LLM response '{answer}', defaulting to Neutral.")
     return 0
 
@@ -131,7 +198,7 @@ def collect_sentences():
     print(f"Found {len(rows)} sentences across {len(txt_files)} meeting files.")
     return rows
 
-def main():
+def main(k_few_shot=6):
     existing = load_manual_annotations()
     already_done = load_output_checkpoint()
 
@@ -140,13 +207,16 @@ def main():
         print("No sentences found in input folder. Run c_selectPhrases.py first.")
         return
 
-    #client = OpenAI(api_key=api_key, base_url=base_url)
+    # Inicialização dos Modelos
+    print("Carregando modelo de embedding...")
+    embedding_model = HuggingFaceEmbeddings(model_name="Qwen/Qwen3-Embedding-0.6B")
+    
+    print(f"Inicializando Ollama ({MODEL})...")
+    llm = Ollama(model=MODEL, temperature=0)
 
-    few_shot_messages = build_few_shot_messages(existing)
-    print(f"Built {len(few_shot_messages) // 2} few-shot examples from human annotations.")
-    #print(few_shot_messages)
+    # Prepara os vetores para busca dinâmica de exemplos
+    human_examples, example_vectors = prepare_few_shot_index(existing, embedding_model)
 
-    sys.exit()
     write_header = not os.path.exists(OUTPUT_FILE) or os.path.getsize(OUTPUT_FILE) == 0
     out_f = open(OUTPUT_FILE, 'a', encoding='utf-8', newline='')
     writer = csv.DictWriter(out_f, fieldnames=['Date', 'Model', 'Grade', 'Sentence'], delimiter='|')
@@ -162,12 +232,21 @@ def main():
 
     unique_pairs = set((d, s) for d, s in sentences)
     to_annotate_list = list(dict.fromkeys((d, s) for d, s in sentences if (d, s) not in already_done))
+
+    sys.exit()
     print(f"Skipping {len(unique_pairs) - len(to_annotate_list)} already-annotated sentences, calling LLM for {len(to_annotate_list)} new sentences.")
 
     for date_str, sentence in tqdm(to_annotate_list, desc="Annotating", unit="sentence"):
         while True:
             try:
-                grade = annotate_sentence(client, sentence, few_shot_messages)
+                grade = annotate_sentence(
+                    llm=llm,
+                    sentence=sentence,
+                    embedding_model=embedding_model,
+                    human_examples=human_examples,
+                    example_vectors=example_vectors,
+                    k=k_few_shot
+                )
                 writer.writerow({'Date': date_str, 'Model': MODEL, 'Grade': grade, 'Sentence': sentence})
                 out_f.flush()
                 time.sleep(REQUEST_DELAY)
@@ -178,6 +257,7 @@ def main():
 
     out_f.close()
 
+    # Reordena o arquivo final por data
     with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='|')
         all_rows = list(reader)
@@ -190,4 +270,5 @@ def main():
     print(f"\nDone. {len(all_rows)} total annotations saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
-    main()
+    # Pode passar a quantidade de exemplos dinamicos (ex: 6) via parâmetro no main
+    main(k_few_shot=6)
